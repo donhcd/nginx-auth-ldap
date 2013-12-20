@@ -78,6 +78,13 @@ typedef struct {
 typedef struct {
     ngx_str_t realm;
     ngx_array_t *servers;       /* array of ngx_http_auth_ldap_server_t* */
+    
+    /* Copied from struct ngx_http_auth_ldap_server_t */
+    ngx_array_t *require_group;     /* array of ngx_http_complex_value_t */
+    ngx_array_t *require_user;      /* array of ngx_http_complex_value_t */
+    ngx_flag_t require_valid_user;
+    ngx_http_complex_value_t require_valid_user_dn;
+    ngx_flag_t satisfy_all;
 } ngx_http_auth_ldap_loc_conf_t;
 
 typedef struct {
@@ -98,7 +105,8 @@ typedef enum {
     PHASE_START,
     PHASE_SEARCH,
     PHASE_CHECK_USER,
-    PHASE_CHECK_GROUP,
+    PHASE_CHECK_GROUP_ALCF,
+    PHASE_CHECK_GROUP_CTX,
     PHASE_CHECK_BIND,
     PHASE_REBIND,
     PHASE_NEXT
@@ -157,6 +165,9 @@ static char * ngx_http_auth_ldap_ldap_server_block(ngx_conf_t *cf, ngx_command_t
 static char * ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf);
 static char * ngx_http_auth_ldap(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char * ngx_http_auth_ldap_servers(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static char * ngx_http_auth_ldap_require(ngx_conf_t *, ngx_command_t *, void *);
+static char * ngx_http_auth_ldap_satisfy(ngx_conf_t *, ngx_command_t *, void *);
+
 static char * ngx_http_auth_ldap_parse_url(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server);
 static char * ngx_http_auth_ldap_parse_require(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server);
 static char * ngx_http_auth_ldap_parse_satisfy(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server);
@@ -174,8 +185,10 @@ static ngx_int_t ngx_http_auth_ldap_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx,
         ngx_http_auth_ldap_loc_conf_t *conf);
 static ngx_int_t ngx_http_auth_ldap_search(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx);
-static ngx_int_t ngx_http_auth_ldap_check_user(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx);
-static ngx_int_t ngx_http_auth_ldap_check_group(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx);
+static ngx_int_t ngx_http_auth_ldap_check_user_ctx(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx);
+static ngx_int_t ngx_http_auth_ldap_check_user_alcf(ngx_http_request_t *r, ngx_http_auth_ldap_loc_conf_t *conf, ngx_http_auth_ldap_ctx_t *ctx);
+static ngx_int_t ngx_http_auth_ldap_check_group_ctx(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx);
+static ngx_int_t ngx_http_auth_ldap_check_group_alcf(ngx_http_request_t *r, ngx_http_auth_ldap_loc_conf_t *conf, ngx_http_auth_ldap_ctx_t *ctx);
 static ngx_int_t ngx_http_auth_ldap_check_bind(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx);
 static ngx_int_t ngx_http_auth_ldap_recover_bind(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx);
 
@@ -230,6 +243,20 @@ static ngx_command_t ngx_http_auth_ldap_commands[] = {
         0,
         NULL
     },
+    {
+        ngx_string("auth_ldap_require"),
+        NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LMT_CONF | NGX_CONF_TAKE12,
+        ngx_http_auth_ldap_require,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        0,
+        NULL },
+    {
+        ngx_string("auth_ldap_satisfy"),
+        NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LMT_CONF | NGX_CONF_TAKE1,
+        ngx_http_auth_ldap_satisfy,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        0,
+        NULL },
     ngx_null_command
 };
 
@@ -434,6 +461,78 @@ ngx_http_auth_ldap_servers(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     return NGX_CONF_OK;
+}
+
+static char *
+ngx_http_auth_ldap_require(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_auth_ldap_loc_conf_t *alcf = conf;
+    ngx_str_t *value;
+    ngx_http_complex_value_t* target = NULL;
+    ngx_http_compile_complex_value_t ccv;
+
+    value = cf->args->elts;
+
+    if (ngx_strcmp(value[1].data, "valid_user") == 0) {
+        alcf->require_valid_user = 1;
+        if (cf->args->nelts < 3) {
+            return NGX_CONF_OK;
+        }
+        if (alcf->require_valid_user_dn.value.data != NULL) {
+            return "is duplicate";
+        }
+        target = &alcf->require_valid_user_dn;
+    } else if (ngx_strcmp(value[1].data, "user") == 0) {
+        if (alcf->require_user == NULL) {
+            alcf->require_user = ngx_array_create(cf->pool, 4, sizeof(ngx_http_complex_value_t));
+            if (alcf->require_user == NULL) {
+                return NGX_CONF_ERROR;
+            }
+        }
+        target = ngx_array_push(alcf->require_user);
+    } else if (ngx_strcmp(value[1].data, "group") == 0) {
+        if (alcf->require_group == NULL) {
+            alcf->require_group = ngx_array_create(cf->pool, 4, sizeof(ngx_http_complex_value_t));
+            if (alcf->require_group == NULL) {
+                return NGX_CONF_ERROR;
+            }
+        }
+        target = ngx_array_push(alcf->require_group);
+    }
+
+    if (target == NULL) {
+       return NGX_CONF_ERROR;
+    }
+
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+    ccv.cf = cf;
+    ccv.value = &value[2];
+    ccv.complex_value = target;
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+}
+
+static char *
+ngx_http_auth_ldap_satisfy(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
+    ngx_http_auth_ldap_loc_conf_t *alcf = conf;
+    ngx_str_t *value;
+    value = cf->args->elts;
+
+    if (ngx_strcmp(value[1].data, "all") == 0) {
+        alcf->satisfy_all = 1;
+        return NGX_CONF_OK;
+    }
+
+    if (ngx_strcmp(value[1].data, "any") == 0) {
+        alcf->satisfy_all = 0;
+        return NGX_CONF_OK;
+    }
+
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "Incorrect value for auth_ldap_satisfy ");
+    return NGX_CONF_ERROR;
 }
 
 /**
@@ -1557,10 +1656,15 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
 
         switch (ctx->phase) {
             case PHASE_START:
+                if (conf->servers == NULL) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: auth_ldap used without auth_ldap_servers");
+                    return NGX_ERROR;
+                }
                 ctx->server = ((ngx_http_auth_ldap_server_t **) conf->servers->elts)[ctx->server_index];
                 ctx->outcome = -1;
 
                 ngx_add_timer(r->connection->write, 10000); /* TODO: Per-server request timeout */
+                ngx_log_error(NGX_LOG_INFO, r->connection->log, 0, "PHASE_START3");
 
                 /* Check cache if enabled */
                 if (ngx_http_auth_ldap_cache.buckets != NULL) {
@@ -1573,14 +1677,26 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                     }
                 }
 
-                if (ctx->server->require_valid_user_dn.value.data != NULL) {
-                    /* Construct user DN */
-                    if (ngx_http_complex_value(r, &ctx->server->require_valid_user_dn, &ctx->dn) != NGX_OK) {
-                        ngx_del_timer(r->connection->write);
-                        return NGX_ERROR;
+                if (conf->require_user != NULL) {
+                    if (conf->require_valid_user_dn.value.data != NULL) {
+                        /* Construct user DN */
+                        if (ngx_http_complex_value(r, &conf->require_valid_user_dn, &ctx->dn) != NGX_OK) {
+                            ngx_del_timer(r->connection->write);
+                            return NGX_ERROR;
+                        }
+                        ctx->phase = PHASE_CHECK_USER;
+                        break;
                     }
-                    ctx->phase = PHASE_CHECK_USER;
-                    break;
+                } else if (ctx->server->require_user != NULL) {
+                    if (ctx->server->require_valid_user_dn.value.data != NULL) {
+                        /* Construct user DN */
+                        if (ngx_http_complex_value(r, &ctx->server->require_valid_user_dn, &ctx->dn) != NGX_OK) {
+                            ngx_del_timer(r->connection->write);
+                            return NGX_ERROR;
+                        }
+                        ctx->phase = PHASE_CHECK_USER;
+                        break;
+                    }
                 }
 
                 ctx->phase = PHASE_SEARCH;
@@ -1608,8 +1724,15 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                 ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: User DN is \"%V\"",
                     &ctx->dn);
 
-                if (ctx->server->require_user != NULL) {
-                    rc = ngx_http_auth_ldap_check_user(r, ctx);
+                if (conf->require_user != NULL) {
+                    rc = ngx_http_auth_ldap_check_user_alcf(r, conf, ctx);
+                    if (rc != NGX_OK) {
+                        /* User check failed, try next server */
+                        ctx->phase = PHASE_NEXT;
+                        break;
+                    }
+                } else if (ctx->server->require_user != NULL) {
+                    rc = ngx_http_auth_ldap_check_user_ctx(r, ctx);
                     if (rc != NGX_OK) {
                         /* User check failed, try next server */
                         ctx->phase = PHASE_NEXT;
@@ -1618,8 +1741,12 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                 }
 
                 /* User validated, check group next */
-                if (ctx->server->require_group != NULL) {
-                    ctx->phase = PHASE_CHECK_GROUP;
+                if (conf->require_group != NULL) {
+                    ctx->phase = PHASE_CHECK_GROUP_ALCF;
+                    ctx->iteration = 0;
+                    break;
+                } else if (ctx->server->require_group != NULL) {
+                    ctx->phase = PHASE_CHECK_GROUP_CTX;
                     ctx->iteration = 0;
                     break;
                 }
@@ -1629,8 +1756,25 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                 ctx->iteration = 0;
                 break;
 
-            case PHASE_CHECK_GROUP:
-                rc = ngx_http_auth_ldap_check_group(r, ctx);
+            case PHASE_CHECK_GROUP_ALCF:
+                rc = ngx_http_auth_ldap_check_group_alcf(r, conf, ctx);
+                if (rc == NGX_AGAIN) {
+                    /* LDAP operation in progress, wait for the results */
+                    return NGX_AGAIN;
+                }
+                if (rc != NGX_OK) {
+                    /* Group check failed, try next server */
+                    ctx->phase = PHASE_NEXT;
+                    break;
+                }
+
+                /* Groups validated, try binding next */
+                ctx->phase = PHASE_CHECK_BIND;
+                ctx->iteration = 0;
+                break;
+
+            case PHASE_CHECK_GROUP_CTX:
+                rc = ngx_http_auth_ldap_check_group_ctx(r, ctx);
                 if (rc == NGX_AGAIN) {
                     /* LDAP operation in progress, wait for the results */
                     return NGX_AGAIN;
@@ -1647,7 +1791,7 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                 break;
 
             case PHASE_CHECK_BIND:
-                if (ctx->server->require_valid_user == 0) {
+                if (ctx->server->require_valid_user == 0 && conf->require_valid_user) {
                     ctx->phase = PHASE_NEXT;
                     break;
                 }
@@ -1764,7 +1908,7 @@ ngx_http_auth_ldap_search(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
 }
 
 static ngx_int_t
-ngx_http_auth_ldap_check_user(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
+ngx_http_auth_ldap_check_user_ctx(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
 {
     ngx_http_complex_value_t *values;
     ngx_uint_t i;
@@ -1795,7 +1939,38 @@ ngx_http_auth_ldap_check_user(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *c
 }
 
 static ngx_int_t
-ngx_http_auth_ldap_check_group(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
+ngx_http_auth_ldap_check_user_alcf(ngx_http_request_t *r, ngx_http_auth_ldap_loc_conf_t *conf, ngx_http_auth_ldap_ctx_t *ctx)
+{
+    ngx_http_complex_value_t *values;
+    ngx_uint_t i;
+
+    values = conf->require_user->elts;
+    for (i = 0; i < conf->require_user->nelts; i++) {
+        ngx_str_t val;
+        if (ngx_http_complex_value(r, &values[i], &val) != NGX_OK) {
+            ctx->outcome = -1;
+            return NGX_ERROR;
+        }
+
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Comparing user DN with \"%V\"", &val);
+        if (val.len == ctx->dn.len && ngx_memcmp(val.data, ctx->dn.data, val.len) == 0) {
+            if (ctx->server->satisfy_all == 0) {
+                ctx->outcome = 1;
+                return NGX_OK;
+            }
+        } else {
+            if (ctx->server->satisfy_all == 1) {
+                ctx->outcome = 0;
+                return NGX_DECLINED;
+            }
+        }
+    }
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_auth_ldap_check_group_ctx(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
 {
     ngx_http_complex_value_t *values;
     struct berval bvalue;
@@ -1836,6 +2011,81 @@ ngx_http_auth_ldap_check_group(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *
 
     ngx_str_t val;
     values = ctx->server->require_group->elts;
+    if (ngx_http_complex_value(r, &values[ctx->iteration], &val) != NGX_OK) {
+        ctx->outcome = -1;
+        ngx_http_auth_ldap_return_connection(ctx->c);
+        return NGX_ERROR;
+    }
+
+    if (ctx->server->group_attribute_dn == 1) {
+        bvalue.bv_val = (char*) ctx->dn.data;
+        bvalue.bv_len = ctx->dn.len;
+    } else {
+        bvalue.bv_val = (char*) r->headers_in.user.data;
+        bvalue.bv_len = r->headers_in.user.len;
+    }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Comparing user group with \"%V\"", &val);
+
+    rc = ldap_compare_ext(ctx->c->ld, (const char *) val.data, (const char *) ctx->server->group_attribute.data,
+            &bvalue, NULL, NULL, &ctx->c->msgid);
+    if (rc != LDAP_SUCCESS) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: ldap_compare_ext() failed (%d: %s)",
+            rc, ldap_err2string(rc));
+        ctx->outcome = -1;
+        ngx_http_auth_ldap_return_connection(ctx->c);
+        return NGX_ERROR;
+    }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: ldap_compare_ext() -> msgid=%d",
+        ctx->c->msgid);
+    ctx->c->state = STATE_COMPARING;
+    ctx->iteration++;
+    return NGX_AGAIN;
+}
+
+static ngx_int_t
+ngx_http_auth_ldap_check_group_alcf(ngx_http_request_t *r, ngx_http_auth_ldap_loc_conf_t *conf, ngx_http_auth_ldap_ctx_t *ctx)
+{
+    ngx_http_complex_value_t *values;
+    struct berval bvalue;
+    ngx_int_t rc;
+
+    /* Handle result of the comparison started during previous call */
+    if (ctx->iteration > 0) {
+        if (ctx->error_code == LDAP_COMPARE_TRUE) {
+            if (ctx->server->satisfy_all == 0) {
+                ctx->outcome = 1;
+                return NGX_OK;
+            }
+        } else if (ctx->error_code == LDAP_COMPARE_FALSE || ctx->error_code == LDAP_NO_SUCH_ATTRIBUTE) {
+            if (ctx->server->satisfy_all == 1) {
+                ctx->outcome = 0;
+                return NGX_DECLINED;
+            }
+        } else {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: ldap_compare_ext() request failed (%d: %s)",
+                ctx->error_code, ldap_err2string(ctx->error_code));
+            return NGX_ERROR;
+        }
+    }
+
+    /* Check next group */
+    if (ctx->iteration >= conf->require_group->nelts) {
+        /* No more groups */
+        if (ctx->server->satisfy_all == 0) {
+            return NGX_DECLINED;
+        } else {
+            return NGX_OK;
+        }
+    }
+
+    if (!ngx_http_auth_ldap_get_connection(ctx)) {
+        return NGX_AGAIN;
+    }
+
+    ngx_str_t val;
+    values = conf->require_group->elts;
     if (ngx_http_complex_value(r, &values[ctx->iteration], &val) != NGX_OK) {
         ctx->outcome = -1;
         ngx_http_auth_ldap_return_connection(ctx->c);
