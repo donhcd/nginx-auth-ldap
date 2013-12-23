@@ -1772,8 +1772,6 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                 break;
 
             case PHASE_CHECK_USER:
-                /* XXX */
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap/PHASE_CHECK_USER: User DN is \"%V\"", &ctx->dn);
                 ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: User DN is \"%V\"",
                     &ctx->dn);
 
@@ -1844,8 +1842,6 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                 break;
 
             case PHASE_CHECK_BIND:
-                /* XXX */
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap/PHASE_CHECK_BIND (%d/%d)", ctx->server->require_valid_user, conf->require_valid_user);
                 if (ctx->server->require_valid_user == 0 && conf->require_valid_user == 0) {
                     ngx_log_error(NGX_LOG_INFO, r->connection->log, 0, "going to PHASE_NEXT");
                     ctx->phase = PHASE_NEXT;
@@ -2009,8 +2005,6 @@ ngx_http_auth_ldap_check_user_alcf(ngx_http_request_t *r, ngx_http_auth_ldap_loc
             return NGX_ERROR;
         }
 
-        /* XXX */
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: Comparing user DN \"%s\" with \"%V\"", ctx->dn.data, &val);
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Comparing user DN with \"%V\"", &val);
         if (val.len == ctx->dn.len && ngx_memcmp(val.data, ctx->dn.data, val.len) == 0) {
             if (conf->satisfy_all == 0) {
@@ -2018,8 +2012,6 @@ ngx_http_auth_ldap_check_user_alcf(ngx_http_request_t *r, ngx_http_auth_ldap_loc
                 return NGX_OK;
             }
         } else {
-            /* XXX */
-            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: Comparing user UID \"%s\" with \"%V\"", ctx->uid.data, &val);
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Comparing user UID with \"%V\"", &val);
             
             if (val.len == ctx->uid.len && ngx_memcmp(val.data, ctx->uid.data, val.len) == 0) {
@@ -2215,8 +2207,6 @@ ngx_http_auth_ldap_check_bind(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *c
             return NGX_ERROR;
         }
 
-        /* XXX */
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: ldap_sasl_bind() -> msgid=%d", ctx->c->msgid);
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: ldap_sasl_bind() -> msgid=%d",
             ctx->c->msgid);
         ctx->c->state = STATE_BINDING;
@@ -2230,8 +2220,6 @@ ngx_http_auth_ldap_check_bind(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *c
             ctx->error_code, ldap_err2string(ctx->error_code));
         ctx->outcome = 0;
     } else {
-        /* XXX */
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: User bind successful");
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: User bind successful");
         ctx->outcome = 1;
     }
