@@ -1,8 +1,9 @@
 # LDAP Authentication module for nginx
 LDAP module for nginx which supports:
 * authentication against multiple LDAP servers
-* per location authentication requirements without defining the same server again and again
-* case sensitive user accounts, LDAP is case insensitive
+* per location authentication requirements without defining the same server again for different authorization requirement
+* case sensitive user accounts, just like all other web servers have
+* LDAP-users can be specified with UID or DN
 
 # How to install
 
@@ -58,6 +59,24 @@ And add required servers in correct order into your location/server directive:
             auth_ldap_servers test1;
             auth_ldap_servers test2;
             require valid_user;
+        }
+
+        location /specific-user-DN {
+            root   html;
+
+            auth_ldap "Forbidden";
+            auth_ldap_servers test1;
+            auth_ldap_servers test2;
+            auth_ldap_require group 'cn=AllowedUser,ou=Users,DC=test,DC=local';
+        }
+
+        location /specific-user-UID {
+            root   html;
+
+            auth_ldap "Forbidden";
+            auth_ldap_servers test1;
+            auth_ldap_servers test2;
+            auth_ldap_require group 'alloweduser';
         }
 
         location /specific-group {

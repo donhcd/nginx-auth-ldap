@@ -1,6 +1,7 @@
 /**
  * Copyright (C) 2011-2013 Valery Komarov <komarov@valerka.net>
  * Copyright (C) 2013 Jiri Hruska <jirka@fud.cz>
+ * Copyright (C) 2013 Jari Turkia <jatu@hqcodeshop.fi>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -126,6 +127,7 @@ typedef struct {
     int error_code;
     ngx_str_t error_msg;
     ngx_str_t dn;
+    ngx_str_t uid;
 
     ngx_http_auth_ldap_cache_elt_t *cache_bucket;
     u_char cache_big_hash[16];
@@ -473,7 +475,7 @@ ngx_http_auth_ldap_require(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     value = cf->args->elts;
 
-    if (ngx_strcmp(value[1].data, "valid_user") == 0) {
+   if (ngx_strcmp(value[1].data, "valid_user") == 0) {
         alcf->require_valid_user = 1;
         if (cf->args->nelts < 3) {
             return NGX_CONF_OK;
@@ -483,20 +485,22 @@ ngx_http_auth_ldap_require(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
         target = &alcf->require_valid_user_dn;
     } else if (ngx_strcmp(value[1].data, "user") == 0) {
-        if (alcf->require_user == NULL) {
+        if (alcf->require_user == NULL || alcf->require_user == NGX_CONF_UNSET_PTR) {
             alcf->require_user = ngx_array_create(cf->pool, 4, sizeof(ngx_http_complex_value_t));
             if (alcf->require_user == NULL) {
                 return NGX_CONF_ERROR;
             }
         }
+        alcf->require_valid_user = 1;
         target = ngx_array_push(alcf->require_user);
     } else if (ngx_strcmp(value[1].data, "group") == 0) {
-        if (alcf->require_group == NULL) {
+        if (alcf->require_group == NULL || alcf->require_group == NGX_CONF_UNSET_PTR) {
             alcf->require_group = ngx_array_create(cf->pool, 4, sizeof(ngx_http_complex_value_t));
             if (alcf->require_group == NULL) {
                 return NGX_CONF_ERROR;
             }
         }
+        alcf->require_valid_user = 1;
         target = ngx_array_push(alcf->require_group);
     }
 
@@ -775,6 +779,14 @@ ngx_http_auth_ldap_create_loc_conf(ngx_conf_t *cf)
         return NULL;
     }
     conf->servers = NGX_CONF_UNSET_PTR;
+    conf->require_group = NGX_CONF_UNSET_PTR;
+    conf->require_user = NGX_CONF_UNSET_PTR;
+    conf->require_valid_user = NGX_CONF_UNSET;
+/*    ngx_str_null(conf->require_valid_user_dn.value); */
+    conf->require_valid_user_dn.flushes = NGX_CONF_UNSET_PTR;
+    conf->require_valid_user_dn.lengths = NGX_CONF_UNSET_PTR;
+    conf->require_valid_user_dn.values = NGX_CONF_UNSET_PTR;
+    conf->satisfy_all = NGX_CONF_UNSET;
 
     return conf;
 }
@@ -792,6 +804,13 @@ ngx_http_auth_ldap_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         conf->realm = prev->realm;
     }
     ngx_conf_merge_ptr_value(conf->servers, prev->servers, NULL);
+
+    ngx_conf_merge_ptr_value(conf->require_group, prev->require_group, NULL);
+    ngx_conf_merge_ptr_value(conf->require_user, prev->require_user, NULL);
+    ngx_conf_merge_value(conf->require_valid_user, prev->require_valid_user, 0);
+    ngx_conf_merge_str_value(conf->require_valid_user_dn.value, prev->require_valid_user_dn.value, NULL);
+    ngx_conf_merge_ptr_value(conf->require_valid_user_dn.flushes, prev->require_valid_user_dn.flushes, NULL);
+    ngx_conf_merge_value(conf->satisfy_all, prev->satisfy_all, 0);
 
     return NGX_CONF_OK;
 }
@@ -1413,6 +1432,39 @@ ngx_http_auth_ldap_read_handler(ngx_event_t *rev)
                             ngx_memcpy(c->rctx->dn.data, dn, c->rctx->dn.len + 1);
                             ldap_memfree(dn);
                         }
+
+                        /* Iterate attributes and look for UID */
+                        int numEntries = ldap_count_entries(c->ld, result);
+                        int entryIdx = 0;
+                        int found_attr = 0;
+                        LDAPMessage* entry;
+                        for (entry = ldap_first_entry(c->ld, result);
+                            entry != NULL && entryIdx < numEntries && !found_attr;
+                            entry = ldap_next_entry(c->ld, entry), ++entryIdx) {
+                            char* attr;
+                            BerElement* ber;
+                            for (attr = ldap_first_attribute(c->ld, entry, &ber);
+                                attr != NULL && !found_attr;
+                                attr = ldap_next_attribute(c->ld, entry, ber)) {
+                                if (ngx_strncmp(c->rctx->server->ludpp->lud_attrs[0], attr, ngx_strlen(attr)) == 0) {
+                                    found_attr = 1;
+                                    struct berval** vals;
+                                    vals = ldap_get_values_len(c->ld, entry, attr);
+                                    if (ldap_count_values_len(vals) > 0) {
+                                        struct berval *val = vals[0];
+                                        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0, "http_auth_ldap: result attribute: %s is %s", attr, vals[0]);
+                                        c->rctx->uid.len = val->bv_len;
+                                        c->rctx->uid.data = (u_char *) ngx_palloc(c->rctx->r->pool, c->rctx->uid.len + 1);
+                                        ngx_memcpy(c->rctx->uid.data, val->bv_val, c->rctx->uid.len + 1);
+                                    } else {
+                                        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "http_auth_ldap: result attribute: %s is empty", attr);
+                                    }
+                                    ldap_memfree(vals);
+                                }
+
+                                ldap_memfree(attr);
+                            }
+                        }
                     }
                 } else if (ldap_msgtype(result) == LDAP_RES_SEARCH_RESULT) {
                     ngx_log_debug3(NGX_LOG_DEBUG_HTTP, c->log, 0, "http_auth_ldap: Received search result (%d: %s [%s])",
@@ -1511,7 +1563,7 @@ ngx_http_auth_ldap_init_connections(ngx_cycle_t *cycle)
 
     halmcf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_auth_ldap_module);
     if (halmcf == NULL || halmcf->servers == NULL) {
-	return NGX_OK;
+        return NGX_OK;
     }
 
     option = LDAP_VERSION3;
@@ -1664,7 +1716,6 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                 ctx->outcome = -1;
 
                 ngx_add_timer(r->connection->write, 10000); /* TODO: Per-server request timeout */
-                ngx_log_error(NGX_LOG_INFO, r->connection->log, 0, "PHASE_START3");
 
                 /* Check cache if enabled */
                 if (ngx_http_auth_ldap_cache.buckets != NULL) {
@@ -1721,6 +1772,8 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                 break;
 
             case PHASE_CHECK_USER:
+                /* XXX */
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap/PHASE_CHECK_USER: User DN is \"%V\"", &ctx->dn);
                 ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: User DN is \"%V\"",
                     &ctx->dn);
 
@@ -1791,7 +1844,10 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                 break;
 
             case PHASE_CHECK_BIND:
-                if (ctx->server->require_valid_user == 0 && conf->require_valid_user) {
+                /* XXX */
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap/PHASE_CHECK_BIND (%d/%d)", ctx->server->require_valid_user, conf->require_valid_user);
+                if (ctx->server->require_valid_user == 0 && conf->require_valid_user == 0) {
+                    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0, "going to PHASE_NEXT");
                     ctx->phase = PHASE_NEXT;
                     break;
                 }
@@ -1854,7 +1910,7 @@ ngx_http_auth_ldap_search(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
 {
     LDAPURLDesc *ludpp;
     u_char *filter;
-    char *attrs[2];
+    char *attrs[3];
     ngx_int_t rc;
 
     /* On the first call, initiate the LDAP search operation */
@@ -1868,14 +1924,15 @@ ngx_http_auth_ldap_search(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
             r->pool,
             (ludpp->lud_filter != NULL ? ngx_strlen(ludpp->lud_filter) : ngx_strlen("(objectClass=*)")) +
             ngx_strlen("(&(=))") + ngx_strlen(ludpp->lud_attrs[0]) + r->headers_in.user.len + 1);
-        ngx_sprintf(filter, "(&%s(%s=%V))%Z",
+        ngx_sprintf(filter, "(&%s(%s:caseExactMatch:=%V))%Z",
                 ludpp->lud_filter != NULL ? ludpp->lud_filter : "(objectClass=*)",
                 ludpp->lud_attrs[0], &r->headers_in.user);
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Search filter is \"%s\"",
             (const char *) filter);
 
-        attrs[0] = LDAP_NO_ATTRS;
-        attrs[1] = NULL;
+        attrs[0] = ludpp->lud_attrs[0];
+        attrs[1] = LDAP_NO_ATTRS;
+        attrs[2] = NULL;
 
         rc = ldap_search_ext(ctx->c->ld, ludpp->lud_dn, ludpp->lud_scope, (const char *) filter, attrs, 0, NULL, NULL, NULL, 0, &ctx->c->msgid);
         if (rc != LDAP_SUCCESS) {
@@ -1952,16 +2009,29 @@ ngx_http_auth_ldap_check_user_alcf(ngx_http_request_t *r, ngx_http_auth_ldap_loc
             return NGX_ERROR;
         }
 
+        /* XXX */
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: Comparing user DN \"%s\" with \"%V\"", ctx->dn.data, &val);
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Comparing user DN with \"%V\"", &val);
         if (val.len == ctx->dn.len && ngx_memcmp(val.data, ctx->dn.data, val.len) == 0) {
-            if (ctx->server->satisfy_all == 0) {
+            if (conf->satisfy_all == 0) {
                 ctx->outcome = 1;
                 return NGX_OK;
             }
         } else {
-            if (ctx->server->satisfy_all == 1) {
-                ctx->outcome = 0;
-                return NGX_DECLINED;
+            /* XXX */
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: Comparing user UID \"%s\" with \"%V\"", ctx->uid.data, &val);
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Comparing user UID with \"%V\"", &val);
+            
+            if (val.len == ctx->uid.len && ngx_memcmp(val.data, ctx->uid.data, val.len) == 0) {
+                if (conf->satisfy_all == 0) {
+                    ctx->outcome = 1;
+                    return NGX_OK;
+                }
+            } else {
+                if (conf->satisfy_all == 1) {
+                    ctx->outcome = 0;
+                    return NGX_DECLINED;
+                }
             }
         }
     }
@@ -2145,6 +2215,8 @@ ngx_http_auth_ldap_check_bind(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *c
             return NGX_ERROR;
         }
 
+        /* XXX */
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: ldap_sasl_bind() -> msgid=%d", ctx->c->msgid);
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: ldap_sasl_bind() -> msgid=%d",
             ctx->c->msgid);
         ctx->c->state = STATE_BINDING;
@@ -2158,6 +2230,8 @@ ngx_http_auth_ldap_check_bind(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *c
             ctx->error_code, ldap_err2string(ctx->error_code));
         ctx->outcome = 0;
     } else {
+        /* XXX */
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: User bind successful");
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: User bind successful");
         ctx->outcome = 1;
     }
