@@ -79,7 +79,7 @@ typedef struct {
 typedef struct {
     ngx_str_t realm;
     ngx_array_t *servers;       /* array of ngx_http_auth_ldap_server_t* */
-    
+
     /* Copied from struct ngx_http_auth_ldap_server_t */
     ngx_array_t *require_group;     /* array of ngx_http_complex_value_t */
     ngx_array_t *require_user;      /* array of ngx_http_complex_value_t */
@@ -2013,7 +2013,7 @@ ngx_http_auth_ldap_check_user_alcf(ngx_http_request_t *r, ngx_http_auth_ldap_loc
             }
         } else {
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Comparing user UID with \"%V\"", &val);
-            
+
             if (val.len == ctx->uid.len && ngx_memcmp(val.data, ctx->uid.data, val.len) == 0) {
                 if (conf->satisfy_all == 0) {
                     ctx->outcome = 1;
@@ -2089,8 +2089,13 @@ ngx_http_auth_ldap_check_group_ctx(ngx_http_request_t *r, ngx_http_auth_ldap_ctx
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Comparing user group with \"%V\"", &val);
 
-    rc = ldap_compare_ext(ctx->c->ld, (const char *) val.data, (const char *) ctx->server->group_attribute.data,
-            &bvalue, NULL, NULL, &ctx->c->msgid);
+    if (ctx->server->group_attribute.data == NULL) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: group_attribute.data is \"%V\" so calling a failure here", &ctx->server->group_attribute.data);
+        rc = !LDAP_SUCCESS;
+    } else {
+        rc = ldap_compare_ext(ctx->c->ld, (const char *) val.data, (const char *) ctx->server->group_attribute.data,
+                &bvalue, NULL, NULL, &ctx->c->msgid);
+    }
     if (rc != LDAP_SUCCESS) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: ldap_compare_ext() failed (%d: %s)",
             rc, ldap_err2string(rc));
@@ -2164,8 +2169,13 @@ ngx_http_auth_ldap_check_group_alcf(ngx_http_request_t *r, ngx_http_auth_ldap_lo
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Comparing user group with \"%V\"", &val);
 
-    rc = ldap_compare_ext(ctx->c->ld, (const char *) val.data, (const char *) ctx->server->group_attribute.data,
-            &bvalue, NULL, NULL, &ctx->c->msgid);
+    if (ctx->server->group_attribute.data == NULL) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: group_attribute.data is \"%V\" so calling a failure here", &ctx->server->group_attribute.data);
+        rc = !LDAP_SUCCESS;
+    } else {
+        rc = ldap_compare_ext(ctx->c->ld, (const char *) val.data, (const char *) ctx->server->group_attribute.data,
+                &bvalue, NULL, NULL, &ctx->c->msgid);
+    }
     if (rc != LDAP_SUCCESS) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: ldap_compare_ext() failed (%d: %s)",
             rc, ldap_err2string(rc));
